@@ -1,0 +1,9 @@
+accelerate==1.12.0
+captum==0.8.0
+einops==0.8.2
+matplotlib==3.10.8
+netCDF4==1.7.4
+numpy==2.4.2
+torch==2.10.0
+tqdm==4.67.1
+xarray==2026.2.0
