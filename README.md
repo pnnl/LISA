@@ -174,6 +174,7 @@ If you use this code, please cite:
 ## Acknowledgments
 
 This material is based upon work supported by the U.S. Department of Energy, Office of Science, Energy Earthshot Initiative as part of the "Addressing Challenges in Energy: Floating Wind in a Changing Climate (ACE-FWICC)” at Pacific Northwest National Laboratory (PNNL) under contract #KJ0406010/KP1601013/81823. The initial effort was inspired by an AI Hackathon organized by the Atmospheric, Climate, and Earth Sciences (ACES) Division at PNNL (Chen 2025). 
+
 This research used resources of the National Energy Research Scientific Computing Center (NERSC), a Department of Energy Office of Science User Facility using NERSC award BER-ERCAP0026987 and This research used resources of the National Energy Research Scientific Computing Center (NERSC), a Department of Energy User Facility using NERSC award DDR-ERCAP0030520 through AI4Sci@NERSC. A portion of the research was performed using resources available through Research Computing at PNNL. PNNL is operated by Battelle for the U.S. Department of Energy under Contract DE-AC05-76RL01830. 
 
 
