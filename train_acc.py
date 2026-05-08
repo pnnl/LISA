@@ -6,8 +6,7 @@ import os, sys
 import os.path as path
 from datetime import datetime
 import logging
-from data.dataloader_nc_v2 import dataloader_superres
-#from data.dataloader_nc import dataloader_superres
+from data.dataloader_nc import dataloader_superres
 from models.models import  ERAencoder, ERAdecoder, ERA5Upscaler, ERA5UpscalerV2
 from models.mae import MAE, MAE_decoder
 from utils.forecast_metrics import reconstruct_image_reduced, plot_reconstruction, reconstruct_image
@@ -17,13 +16,33 @@ import itertools
 from itertools import cycle
 import einops
 import numpy as np
+logging.basicConfig(level=logging.DEBUG)
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from dataclasses import dataclass, fields
 import pickle
 from captum.attr import IntegratedGradients
 
-logging.basicConfig(level=logging.DEBUG)
+def get_mask_prob(epoch, total_epochs=50, schedule_type='cosine', final_ratio=0.5, decay_epochs=None):
+    """Calculate mask probability for a given epoch and schedule."""
+    progress = epoch / total_epochs
+
+    if schedule_type == 'cosine':
+        return 1.0 - (1 - final_ratio) * (1 - np.cos(np.pi * progress)) / 2
+    elif schedule_type == 'linear':
+        return 1.0 - (1 - final_ratio) * progress
+    elif schedule_type == 'static':
+        if epoch < total_epochs:
+            return final_ratio
+        else:
+            return 0.0
+    elif schedule_type == 'cosine_plateau':
+        # Cosine from 1 to 0 in decay_epochs, then plateau at 0
+        if epoch < decay_epochs:
+            progress_decay = epoch / decay_epochs
+            return 1.0 - (1 - np.cos(np.pi * progress_decay)) / 2
+        else:
+            return 0.0
 
 train_dataset_ = dataloader_superres( \
                 "/pscratch/sd/j/jderm/ERA5_golden/",
@@ -31,16 +50,9 @@ train_dataset_ = dataloader_superres( \
                 "/global/common/software/m4506/s2s_mae/training/s2s_tar/goldstandard/gold_npy_buoy_test_sorted.csv",
                 pretraining = False,
                 use_npy=True,
-                two_hours=False)
+                two_hours=True)
 patch_mask_indices = torch.tensor(train_dataset_.patch_mask_indices)
 global_baseline = torch.rand(torch.load("/pscratch/sd/j/jderm/median_input.pt").shape)
-
-
-# Count the total number of parameters
-def count_params(model):
-    return sum(p.numel() for p in model.parameters())
-
-
 
 def integrated_gradients_for_spatial_output(model, input_tensor, target_h, target_w, target_dim=None):
     """
@@ -61,7 +73,7 @@ def integrated_gradients_for_spatial_output(model, input_tensor, target_h, targe
         b = x1.shape[0]
         x2 = torch.zeros(b, 910, 200,requires_grad=False).to(x1.device)
         _,p,d = x2.shape
-        outputs,_,_ = model(x1, x2, two_hours=False, decoder_masking_ratio=1)  # Shape: [batch_size, h, w, dim]
+        outputs,_,_ = model(x1, x2, two_hours=True, decoder_masking_ratio=1)  # Shape: [batch_size, h, w, dim]
         coord_int = einops.rearrange(torch.arange(0,1742),'(h w) -> h w',h=67,w=26)[target_h,target_w]
         coord_int = torch.argmax((patch_mask_indices==coord_int).int())
 
@@ -97,29 +109,32 @@ def integrated_gradients_for_spatial_output(model, input_tensor, target_h, targe
 hrrr_mean_var = np.array([ \
 [1.5682458877563477,  3.0335888862609863],
 [-3.9326555728912354,  4.704221725463867]])
+
 #buoy
 hrrr_mean_var = np.array([ \
  [ 1.62887898,  3.81834122],
  [-4.01411624,  6.61316559]])
 
+#def get_mask_prob(epoch, total_epochs=50, schedule_type='cosine', final_ratio=0.5, decay_epochs=None):
+
 class trainer():
     def __init__(self, device, checkpoint_path, experiment_string, pretrain, finetune1, finetune2, npy ,epochs, batch_size, dataparallel,
-                 era5_path, hrrr_path, train_file, val_file, grad_accumulation_steps, validate,
+                 era5_path, hrrr_path, train_file, val_file, grad_accumulation_steps, validate, save_model, save_model_path,
                  encoder_learning_rate, encoder_weight_decay, decoder_learning_rate, decoder_weight_decay,
                  encoder_depth, encoder_dim, encoder_channels, encoder_heads, encoder_mlp_dim, encoder_num_registers, 
                  decoder_depth, decoder_dim, decoder_channels, decoder_heads, decoder_mlp_dim,
-                 encoder_masking_ratio, decoder_masking_ratio, grad_norm, seed, beta1, beta2, eps):
+                 encoder_masking_ratio, decoder_masking_ratio, grad_norm, seed, beta1, beta2, eps,
+                 mask_schedule_type, mask_schedule_final_ratio, mask_schedule_decay_epochs, starting_step, starting_epoch):
 
         self.grad_accumulation_steps = grad_accumulation_steps
 
-        self.accelerator = Accelerator(gradient_accumulation_steps=self.grad_accumulation_steps, log_with="tensorboard",project_dir=f"/pscratch/sd/j/jderm/tb_logdir_july/{experiment_string}")
+        self.accelerator = Accelerator(gradient_accumulation_steps=self.grad_accumulation_steps, log_with="tensorboard",project_dir=f"/pscratch/sd/j/jderm/tb_masking/{experiment_string}")
         self.accelerator.init_trackers(experiment_string)
 
 
         logging.info(f"num_process:{self.accelerator.num_processes}")
 
-        #set_seed(self.accelerator.process_index + seed)
-        set_seed(seed)
+        set_seed(self.accelerator.process_index + seed)
 
         tracker = self.accelerator.get_tracker("tensorboard")
         tracker.store_init_configuration({"lr":str(encoder_learning_rate)})
@@ -153,11 +168,15 @@ class trainer():
             if ".pt" in checkpoint_path:
                 self.legacy_checkpoint_bool = True
 
+        self.mask_schedule_type = mask_schedule_type
+        self.mask_schedule_final_ratio = mask_schedule_final_ratio
+        self.mask_schedule_decay_epochs = mask_schedule_decay_epochs
+
         self.pretrain  = pretrain
         self.finetune1 = finetune1
         self.finetune2 = finetune2
         self.npy = npy
-        self.warmup = True
+        self.warmup = False
         self.warmup_steps = 2000 
         self.eval_masking_ratio = 0.60
         self.eval_masking_strategy = 0
@@ -169,6 +188,8 @@ class trainer():
         self.batch_size = batch_size
         self.n_epochs = epochs
         self.experiment_string = experiment_string
+        self.starting_step = starting_step
+        self.starting_epoch = starting_epoch
 
         self.eps = eps
         self.beta1 = beta1
@@ -179,15 +200,17 @@ class trainer():
         self.val_log_interval = self.train_log_interval*4
         self.gpu_interval = self.train_log_interval*16
 
-        self.i_epoch = 0 #100 #65
+        self.i_epoch = 0
         self.i_batch = 0
-        self.i_step = 0 #72550 #24120 #100000 #62320
+        self.i_step = 0
         self.global_loss = None
         self.total_norm = None
 
 
         self.checkpoint_epoch = 0
         self.validate = validate
+        self.save_model = save_model
+        self.save_model_path = save_model_path
 
         if isinstance(device, str):
            if device =='cpu':
@@ -223,20 +246,19 @@ class trainer():
             self.encoder.requires_grad_(False)
             self.encoder.eval()
 
-            #self.hrrr_decoder = ERAdecoder(final_image_size=(670, 260),
-            #    patch_size=(10,10), 
-            #    final_channels=decoder_channels,
-            #    dim=192, #decoder_dim,
-            #    depth=decoder_depth,
-            #    heads=decoder_heads,
-            #    encoder_dim=encoder_dim,
-            #    mlp_dim=decoder_mlp_dim) 
+            self.hrrr_decoder = ERAdecoder(final_image_size=(670, 260),
+                patch_size=(10,10), 
+                final_channels=decoder_channels,
+                dim=decoder_dim,
+                depth=2, #was decoder depth
+                heads=decoder_heads,
+                encoder_dim=encoder_dim,
+                mlp_dim=decoder_mlp_dim) 
 
-            #self.hrrr_decoder = self.hrrr_decoder.to(self.accelerator.device)
+            self.hrrr_decoder = self.hrrr_decoder.to(self.accelerator.device)
 
-            #self.model = MAE_decoder(encoder=self.encoder, hrrr_decoder = self.hrrr_decoder, decoder_dim=192,
-            self.model = MAE_decoder(encoder=self.encoder, decoder_dim=192,
-                                     encoder_masking_ratio=self.encoder_masking_ratio, decoder_depth=decoder_depth,
+            self.model = MAE_decoder(encoder=self.encoder, hrrr_decoder = self.hrrr_decoder, decoder_dim=192,
+                                     encoder_masking_ratio=self.encoder_masking_ratio, decoder_depth=decoder_depth - 2,
                                      decoder_masking_ratio=self.decoder_masking_ratio)
 
 
@@ -247,18 +269,16 @@ class trainer():
                     param.requires_grad = True
 
             """ these have been commented out recently """
-            #for param in self.model.hrrr_decoder.enc_to_dec.parameters():
-            #    param.requires_grad = True
+            for param in self.model.hrrr_decoder.enc_to_dec.parameters():
+                param.requires_grad = True
 
-            #for param in self.model.hrrr_decoder.enc_to_dec_pos.parameters():
-            #    param.requires_grad = True
+            for param in self.model.hrrr_decoder.enc_to_dec_pos.parameters():
+                param.requires_grad = True
 
+
+            """ this shuts off the hrrr-decoder """
             #for param in self.model.hrrr_decoder.transformer.parameters():
-            #    param.requires_grad = False #!!! JRD JRD JRD
-
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    print(name)
+            #    param.requires_grad = True #JRD why one this on?
 
         elif self.finetune2:
 
@@ -300,13 +320,13 @@ class trainer():
             for param in self.model.hrrr_decoder.enc_to_dec_pos.parameters():
                 param.requires_grad = True
 
-            #for name, param in self.model.named_parameters():
-            #    if param.requires_grad:
-            #        print(name)
+        if self.accelerator.is_main_process:
+            logging.info("The Following layers have requires_grad=True")
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    logging.info(param)
 
 
-        num_params = count_params(self.model)
-        print(f"Number of parameters: {num_params:,}")
         self.model = self.model.to(self.accelerator.device)
 
         self.train_dataset = dataloader_superres( \
@@ -315,7 +335,7 @@ class trainer():
                     train_file,
                     pretraining = self.pretrain,
                     use_npy=self.npy,
-                    two_hours=False)
+                    two_hours=True)
 
         self.patch_mask_indices = torch.tensor(self.train_dataset.patch_mask_indices)
         self.patch_mask_anti_indices = torch.tensor(self.train_dataset.patch_mask_anti_indices)
@@ -326,7 +346,7 @@ class trainer():
                     val_file,
                     pretraining = self.pretrain,
                     use_npy=self.npy,
-                    two_hours=False)
+                    two_hours=True)
 
         self.train_dataloader = DataLoader(self.train_dataset,
                                            shuffle=True,
@@ -336,13 +356,13 @@ class trainer():
         if self.accelerator.is_main_process:
 
             self.val_dataloader = DataLoader(self.val_dataset,
-                                               shuffle=True,#not self.validate,
+                                               shuffle= not self.validate,
                                                batch_size=self.batch_size,
                                                num_workers=2)
         else:
 
             self.val_dataloader = DataLoader(self.val_dataset,
-                                               shuffle=True,# not self.validate,
+                                               shuffle= not self.validate,
                                                batch_size=self.batch_size,
                                                num_workers=2)
 
@@ -360,35 +380,12 @@ class trainer():
             self.optimizer = torch.optim.AdamW([\
             {'params': [param for name, param in self.model.named_parameters() if any([f'encoder.transformer.layers.{n}' in name for n in range(4,8)])], 'lr':encoder_learning_rate, 'weight_decay':encoder_weight_decay},
             {'params': [param for name, param in self.model.named_parameters() if not "encoder" in name and not "patch" in name], 'lr':decoder_learning_rate, 'weight_decay':decoder_weight_decay}],betas=(self.beta1,self.beta2), eps=self.eps)
-            #""" For Fine tuning """
-            #self.optimizer = torch.optim.AdamW([\
-            #{'params': [param for name, param in self.model.named_parameters() if any([f'encoder.transformer.layers.{n}' in name for n in range(4,8)])], 'lr':encoder_learning_rate, 'weight_decay':encoder_weight_decay},
-            #{'params': [param for name, param in self.model.named_parameters() if any([f'hrrr_decoder.transformer.layers.{n}' in name for n in range(0,4)])], 'lr':encoder_learning_rate, 'weight_decay':encoder_weight_decay},
-            #                                    {'params': [param for name, param in self.model.named_parameters() if not "hrrr_decoder" in name and not "encoder" in name and not "patch" in name],
-            #                                     'lr':decoder_learning_rate, 'weight_decay':decoder_weight_decay}],
-            #                                    betas=(0.9,0.999), eps=1e-8)
-            
-
-
-        ##self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=24, eta_min=1e-7) 
-        ##self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = 20, gamma=0.94)
-        #self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = 100*self.accelerator.num_processes, gamma=0.977)
-        ##self.scheduler1 = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.977)
 
         if self.pretrain:
-            self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = self.accelerator.num_processes, gamma=0.977) #was 9877, 0.977
-            #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=self.optimizer,T_0=1000,eta_min=0.05*self.decoder_learning_rate,T_mult=2)
+            self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = self.accelerator.num_processes, gamma=0.977) #was 9877, 0.97
 
-        elif False:
-            self.scheduler1 = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = self.accelerator.num_processes, gamma=0.8914) #0.965)
-            self.scheduler2 = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=self.optimizer,T_0=100,eta_min=0.1*self.decoder_learning_rate,T_mult=2)
-            self.scheduler = torch.optim.lr_scheduler.SequentialLR(self.optimizer, schedulers=[self.scheduler1,self.scheduler2],milestones=[400])
-
-            self.scheduler1 = self.accelerator.prepare(self.scheduler1)
-            self.scheduler2 = self.accelerator.prepare(self.scheduler2)
         else:
             self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = 8*self.accelerator.num_processes, gamma=0.977) #was 0.977
-            #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=self.optimizer,T_0=1000,eta_min=0.05*self.decoder_learning_rate,T_mult=2)
 
         self.val_dataloader, self.train_dataloader, self.model, self.optimizer = self.accelerator.prepare(
                 self.val_dataloader, self.train_dataloader, self.model, self.optimizer)
@@ -404,41 +401,30 @@ class trainer():
 
             logging.info(self.accelerator.state)
 
-        """
-        self.model = self.accelerator.unwrap_model(self.model)
-        state_dict = self.model.state_dict()
-        save_dict = {}
-        save_dict['model']={'state_dict':state_dict}
-        #torch.save(save_dict, "/pscratch/sd/j/jderm/july19_14ch_epoch40.pt")
-        torch.save(save_dict, "/pscratch/sd/j/jderm/july19_14ch_finetune.pt")
-        sys.exit(0)
-        """
+        if self.save_model:
 
-        
+            self.model = self.accelerator.unwrap_model(self.model)
+            state_dict = self.model.state_dict()
+            save_dict = {}
+            save_dict['model']={'state_dict':state_dict}
+            torch.save(save_dict, self.save_model_path)
+            logging.debug(f"Model saved to {self.save_model_path}")
+            sys.exit(0)
 
     def train(self):
         logging.debug("starting training")
 
-        if self.checkpoint_epoch is None:
-            start_epoch = 0
-        else:
-            start_epoch = self.checkpoint_epoch + 1
-
-        start_epoch=0
-
-        for self.i_epoch in range(start_epoch, self.n_epochs):
+        for self.i_epoch in range(self.starting_epoch, self.n_epochs):
 
             logging.debug(f"starting epoch {self.i_epoch}")
 
-            #self.decoder_mask_prob = 0.5 - 0.5*np.cos(np.pi*((self.i_epoch+1)/100)) # was 200, /4
-            #self.decoder_mask_prob = 1 - np.cos(np.pi*((self.i_epoch+1)/200)) # was 200, /4
-            self.decoder_mask_prob = 0.5 - 0.5 * np.cos(np.pi*((self.i_epoch+1)/200)) # was 200, /4
+            self.decoder_mask_prob = 1 - np.cos(np.pi*((self.i_epoch+1)/200))
             self.decoder_mask_prob = min(1,self.decoder_mask_prob)
 
-            if self.i_epoch >= 200:
-                self.decoder_mask_prob = 1.0
+            self.decoder_mask_prob = 1 - get_mask_prob(self.i_epoch, total_epochs=self.n_epochs, schedule_type=self.mask_schedule_type, final_ratio=self.mask_schedule_final_ratio, decay_epochs=self.mask_schedule_decay_epochs)
 
-            #self.decoder_mask_prob = 0.995
+            if self.validate:
+                self.decoder_mask_prob = 1
 
             logging.debug(f"{self.decoder_mask_prob=}")
 
@@ -446,13 +432,11 @@ class trainer():
 
             os.system("nvidia-smi > ~/nvidia.log")
 
-            #self.scheduler.step()
-
             if self.i_epoch > 0 and self.i_epoch % self.save_interval == 0:
 
                 self.accelerator.wait_for_everyone()
 
-                self.save_model()
+                self.fcn_save_model()
 
     def load_checkpoint_legacy(self,checkpoint_path):
 
@@ -484,7 +468,6 @@ class trainer():
 
             self.checkpoint_epoch = checkpoint[model_key]['epoch']
 
-            #self.optimizer.load_state_dict(checkpoint[model_key]['optimizer_state_dict'])
 
         elif self.finetune1:
             self.first_finetune_epoch = True
@@ -494,12 +477,12 @@ class trainer():
 
             encoder_keys = [key for key in checkpoint[model_key]['state_dict'].keys() if "encoder." in key and not "mlp" in key]
             self.model.encoder.load_state_dict({key.removeprefix('encoder.'): checkpoint[model_key]['state_dict'][key] for key in encoder_keys})
-            # JRD WHY IS THTIS HERE
-            #enc2dec_keys = [key for key in checkpoint[model_key]['state_dict'].keys() if "enc_to_dec_pos." in key]
-            #self.model.hrrr_decoder.enc_to_dec_pos.load_state_dict({key.removeprefix('enc_to_dec_pos.'): checkpoint[model_key]['state_dict'][key] for key in enc2dec_keys})
 
-            #enc2dec_keys = [key for key in checkpoint[model_key]['state_dict'].keys() if "enc_to_dec." in key]
-            #self.model.hrrr_decoder.enc_to_dec.load_state_dict({key.removeprefix('enc_to_dec.'): checkpoint[model_key]['state_dict'][key] for key in enc2dec_keys})
+            enc2dec_keys = [key for key in checkpoint[model_key]['state_dict'].keys() if "enc_to_dec_pos." in key]
+            self.model.hrrr_decoder.enc_to_dec_pos.load_state_dict({key.removeprefix('enc_to_dec_pos.'): checkpoint[model_key]['state_dict'][key] for key in enc2dec_keys})
+
+            enc2dec_keys = [key for key in checkpoint[model_key]['state_dict'].keys() if "enc_to_dec." in key]
+            self.model.hrrr_decoder.enc_to_dec.load_state_dict({key.removeprefix('enc_to_dec.'): checkpoint[model_key]['state_dict'][key] for key in enc2dec_keys})
 
         elif self.finetune2:
 
@@ -549,7 +532,7 @@ class trainer():
 
         logging.debug("model load successful")
 
-    def save_model(self):
+    def fcn_save_model(self):
 
         current_time = datetime.now()
 
@@ -563,13 +546,8 @@ class trainer():
 
     def one_epoch(self):
 
-        root = logging.getLogger()  # root logger
-        for h in root.handlers:
-            h.flush()
-
         for self.i_batch, (sample_x, sample_y, idx) in enumerate(self.train_dataloader):
 
-            # 14150 has been added for finetuning experiments
             self.accumulated_batches = (self.i_step) // self.grad_accumulation_steps
 
             if self.warmup and self.accumulated_batches <= self.warmup_steps:
@@ -627,12 +605,19 @@ class trainer():
                     self.accelerator.log({"val_loss_steps":self.global_val_loss.detach().mean().item()}, step=self.i_step)
                 self.i_step += 1
 
-
             else:
-                self.global_val_loss = torch.tensor([], device=self.device)
+
+                self.val_losses = []
                 self.eval("val-eval", reconstruct=False)
-                logging.info(f"VAL loss {self.global_val_loss.detach().mean().item()}")
+                
                 self.i_step += 1
+
+                if self.accelerator.is_main_process:
+                    avg_loss = sum(self.val_losses) / len(self.val_losses)
+                    logging.debug(f"{avg_loss=}")
+                    logging.debug(f"avg loss N = {len(self.val_losses)}")
+
+                self.val_losses.clear()  # Reset for next epoch
                 break
 
 
@@ -640,12 +625,15 @@ class trainer():
 
         self.model.eval()
 
+        self.val_losses = []
 
         if phase == "val-eval" or phase == "val":
             dataset = self.val_dataloader
 
         elif phase == "train-eval":
             dataset = self.train_dataloader
+
+        logging.debug(f"eval size is {len(self.val_dataloader)}")
 
         for j, batch in enumerate(dataset):
 
@@ -658,25 +646,28 @@ class trainer():
                 else:
                     self.one_batch_finetune(sample_x, sample_y, phase=phase, reconstruct=reconstruct, index=idx)
 
+                gathered_loss = self.global_val_loss.detach()
 
+                if self.accelerator.is_main_process:
+                    if gathered_loss.dim() == 0:
+                        self.val_losses.append(gathered_loss.item())
+                    else:
+                        self.val_losses.extend(gathered_loss.cpu().tolist())
 
-                #if j % 10 == 0:
-                #    logging.info(f"VAL loss {self.global_val_loss.detach().mean().item()}")
-                #    logging.debug(f"Validated on {j} data")
+                    #if j % 10 == 0:
+                    #    logging.info(f"VAL loss {np.mean(self.val_losses)}")
+                    #    logging.info(f"VAL loss {self.val_losses}")
+                    #    logging.debug(f"Validated on {j} data")
 
             if not self.validate:
                 break
 
         self.model.train()
 
-
     def one_batch_finetune(self, sample_x, sample_y, phase="train", reconstruct=False, index=None):
 
-        test1 = None
-        test2 = None
         if self.finetune1:
-            reconstruction, sample_y2,_, test1, test2 = self.model(sample_x, sample_y, two_hours=False, decoder_masking_ratio=self.decoder_mask_prob)
-
+            reconstruction, sample_y2,_ = self.model(sample_x, sample_y, two_hours=True, decoder_masking_ratio=self.decoder_mask_prob)
 
         if self.finetune2:
             reconstruction, sample_y2, y_full = self.model(sample_x, sample_y, self.patch_mask_indices, self.patch_mask_anti_indices)
@@ -690,22 +681,13 @@ class trainer():
             #with open(f"/pscratch/sd/j/jderm/results_aug/ft5_final_{self.i_step}_{self.accelerator.process_index}.pkl","wb") as f:
             #    pickle.dump(list(file_names.cpu().numpy()),f)
 
-        if phase == "train":
-            loss = F.mse_loss(reconstruction, sample_y2,reduction='none')
-        else:
-            loss = F.mse_loss(reconstruction, sample_y2,reduction='none')
-        loss = loss.reshape(sample_x.shape[0], -1)
-        # CONSISTENCY
-        loss = torch.mean(loss, dim=1)
-        if test1 is not None and test2 is not None:
-            loss += F.l1_loss(test1, test2)
+        loss = F.mse_loss(reconstruction, sample_y2,reduction='mean')
 
         if torch.isnan(loss.mean()):
             logging.info(f"Nan in loss!")
             return
 
         if phase == "train":
-            loss = torch.sum(loss)
             self.accelerator.backward(loss)
             self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_norm, norm_type=2)
             
@@ -733,7 +715,7 @@ class trainer():
         
         elif phase == "val-eval" and reconstruct and False:
 
-            loss = torch.mean(loss)
+            #loss = torch.mean(loss)
             self.global_val_loss = self.accelerator.gather_for_metrics(loss)
 
             ag = integrated_gradients_for_spatial_output(self.accelerator.unwrap_model(self.model), sample_x[0].unsqueeze(0), target_h=(669-191)//10,target_w=143//10, target_dim=None) #Morro
@@ -751,7 +733,7 @@ class trainer():
                     patches, masked_indices, pred_pixel_values = self.accelerator.unwrap_model(self.model).reconstruct(sample_x[:].to(self.device), 
                                                                                                                        sample_y[:].to(self.device),
                                                                                                                        decoder_masking_ratio=1.0,
-                                                                                                                       two_hours=False)
+                                                                                                                       two_hours=True)
 
 
                 b_, p_, dim_ = patches.shape
@@ -906,20 +888,11 @@ class trainer():
                         self.u80_list = list()
                         self.v80_list = list()
 
-            #tracker=self.accelerator.get_tracker("tensorboard")
-
-            #tracker.log_images({"u-80": new_image_ch0}, step=self.i_step)
-            #tracker.log_images({"v-80": new_image_ch1}, step=self.i_step)
 
         elif phase=="val-eval":
-            print(f'{loss.shape=}')
-            #loss = torch.sum(loss).mean() #JRD why was this sum??
-            loss = torch.mean(loss)
-            #self.global_val_loss = torch.cat([self.global_val_loss, self.accelerator.gather_for_metrics(loss)])
             self.global_val_loss = self.accelerator.gather_for_metrics(loss)
 
         elif phase=="train-eval":
-            loss = torch.mean(loss)
             self.global_train_loss = self.accelerator.gather_for_metrics(loss)
 
 
@@ -1022,7 +995,11 @@ def parse_arg():
     parser.add_argument('--pretrain',action="store_true")
     parser.add_argument('--finetune1',action="store_true")
     parser.add_argument('--finetune2',action="store_true")
+    parser.add_argument('--starting-epoch', type=int, required=False)
+    parser.add_argument('--starting-step', type=int, required=False)
     parser.add_argument('--validate',action="store_true")
+    parser.add_argument('--save-model',action="store_true")
+    parser.add_argument('--save-model-path', type=str, required=False)
     parser.add_argument('--npy',action="store_true")
     parser.add_argument('--dataparallel',action="store_true")
     parser.add_argument('--seed',type=int, required=False)
@@ -1052,7 +1029,12 @@ def parse_arg():
     parser.add_argument('--decoder-mlp_dim',type=int,required=False)
     parser.add_argument('--decoder-masking-ratio',type=float,required=False)
 
+    parser.add_argument('--mask-schedule-type',type=str,required=False)
+    parser.add_argument('--mask-schedule-final-ratio',type=float,required=False)
+    parser.add_argument('--mask-schedule-decay-epochs',type=float,required=False)
+
     args = parser.parse_args()
+    
 
     return args
 

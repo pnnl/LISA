@@ -10,6 +10,41 @@ from torch.nn import TransformerDecoder, TransformerDecoderLayer
 import torch.nn.functional as F
 import torch
 
+def make_identity_transformer_layer(layer: nn.TransformerDecoderLayer):
+# 1) Make both attention blocks output zero regardless of inputs
+    for attn in [layer.self_attn, layer.multihead_attn]:
+        if hasattr(attn, 'in_proj_weight'):
+            attn.in_proj_weight.data.zero_()
+        if hasattr(attn, 'in_proj_bias') and attn.in_proj_bias is not None:
+            attn.in_proj_bias.data.zero_()
+            attn.out_proj.weight.data.zero_()
+        if attn.out_proj.bias is not None:
+            attn.out_proj.bias.data.zero_()
+
+    # 2) Make the feed-forward block output zero
+    layer.linear1.weight.data.zero_()
+    if layer.linear1.bias is not None:
+        layer.linear1.bias.data.zero_()
+        layer.linear2.weight.data.zero_()
+    if layer.linear2.bias is not None:
+        layer.linear2.bias.data.zero_()
+
+    # Ensure activation is identity (not strictly needed since inputs to it are zero)
+    layer.activation = nn.Identity()
+
+    # 3) Remove normalization effects
+    layer.norm1 = nn.Identity()
+    layer.norm2 = nn.Identity()
+    layer.norm3 = nn.Identity()
+
+    # 4) Disable dropout (optional; zeros survive dropout anyway)
+    if hasattr(layer, 'dropout'): layer.dropout.p = 0.0
+    if hasattr(layer, 'dropout1'): layer.dropout1.p = 0.0
+    if hasattr(layer, 'dropout2'): layer.dropout2.p = 0.0
+    if hasattr(layer, 'dropout3'): layer.dropout3.p = 0.0
+
+    return layer
+
 
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
@@ -110,6 +145,7 @@ class ERAdecoder(nn.Module):
         self.num_registers=0
 
         transformer_layer = TransformerDecoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=dropout, batch_first = True)
+        #transformer_layer = make_identity_transformer_layer(transformer_layer) #JRD!!!!
         self.transformer = TransformerDecoder(transformer_layer, num_layers=depth)
 
         self.enc_to_dec = nn.Linear(encoder_dim, dim)

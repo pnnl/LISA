@@ -27,10 +27,6 @@ hrrr_mean_var = np.array([ \
 [-1.3613358736038208,  4.049429893493652]])
 
 
-# Count the total number of parameters
-def count_params(model):
-    return sum(p.numel() for p in model.parameters())
-
 
 #unet why are these so differnet
 hrrr_mean_var = np.array([ \
@@ -134,7 +130,6 @@ class trainer():
             decoder_learning_rate *= 1
 
         self.model = UNet(15,2)
-        num_params = count_params(self.model)
         self.model = self.model.to(self.accelerator.device)
 
         self.hrrr_mask = np.load("/global/common/software/m4506/s2s_mae/training/s2s_tar/hrrr_mask_reduced.npy")
@@ -469,9 +464,9 @@ class trainer():
 
                     u80 = np.vstack(self.u80_list)
                     v80 = np.vstack(self.v80_list)
-                    print("recon - save")
-                    #np.save(f"/pscratch/sd/j/jderm/results_unet/u_results_{self.uv_iter}_{self.accelerator.process_id}.npy", u80)
-                    #np.save(f"/pscratch/sd/j/jderm/results_unet/v_results_{self.uv_iter}_{self.accelerator.process_id}.npy", v80)
+
+                    np.save(f"/pscratch/sd/j/jderm/results_unet/u_results_{self.uv_iter}_{self.accelerator.process_id}.npy", u80)
+                    np.save(f"/pscratch/sd/j/jderm/results_unet/v_results_{self.uv_iter}_{self.accelerator.process_id}.npy", v80)
 
                     self.uv_iter += 1
                     logging.info(f"{self.uv_iter}")
@@ -533,9 +528,9 @@ class trainer():
 
             #y_full = y_full.detach().cpu().numpy()
 
-            #np.save(f"/pscratch/sd/j/jderm/results_unet_july/ft_final_{self.i_step}_{self.accelerator.process_index}.npy", pred_clone.detach().cpu())
-            #with open(f"/pscratch/sd/j/jderm/results_unet_july/ft_final_{self.i_step}_{self.accelerator.process_index}.pkl","wb") as f:
-            #    pickle.dump(list(idx.cpu().numpy()),f)
+            np.save(f"/pscratch/sd/j/jderm/results_unet_july/ft_final_{self.i_step}_{self.accelerator.process_index}.npy", pred_clone.detach().cpu())
+            with open(f"/pscratch/sd/j/jderm/results_unet_july/ft_final_{self.i_step}_{self.accelerator.process_index}.pkl","wb") as f:
+                pickle.dump(list(idx.cpu().numpy()),f)
 
         if phase == "val":
 

@@ -99,6 +99,22 @@ class MAE(nn.Module):
         # get the patches to be masked for the final reconstruction loss
         masked_patches = patches[batch_range, masked_indices]
 
+        """
+        num_masked = int(self.masking_ratio * num_patches)
+        rand_indices = torch.rand(batch, num_patches, device = device)
+
+        rand_indices=rand_indices.argsort(dim = -1)
+
+        masked_indices, unmasked_indices = rand_indices[:, :num_masked], rand_indices[:, num_masked:]
+
+        # get the unmasked tokens to be encoded
+        batch_range = torch.arange(batch, device = device)[:, None]
+        tokens = tokens[batch_range, unmasked_indices]
+
+        # get the patches to be masked for the final reconstruction loss
+        masked_patches = patches[batch_range, masked_indices]
+        """
+
         # attend with vision transformer
         encoded_tokens = self.encoder.transformer(tokens)
 
@@ -141,6 +157,7 @@ class MAE_decoder(nn.Module):
         self,
         *,
         encoder,
+        hrrr_decoder,
         decoder_dim,
         encoder_masking_ratio = 0.75,
         decoder_masking_ratio = 0.75,
@@ -163,16 +180,13 @@ class MAE_decoder(nn.Module):
         self.patch_to_emb = nn.Sequential(*encoder.to_patch_embedding[1:])
         pixel_values_per_patch = encoder.to_patch_embedding[2].weight.shape[-1]
 
-        #self.hrrr_decoder = hrrr_decoder
-        #self.hrrr_num_patches, self.hrrr_decoder_dim = self.hrrr_decoder.pos_embedding.shape[-2:]
-        self.hrrr_num_patches, self.hrrr_decoder_dim = 910, 192
+        self.hrrr_decoder = hrrr_decoder
+        self.hrrr_num_patches, self.hrrr_decoder_dim = self.hrrr_decoder.pos_embedding.shape[-2:]
         hrrr_pixel_values_per_patch = 10*10*2
-        self.memory_to_dec = nn.Linear( encoder_dim, self.hrrr_decoder_dim)
 
         # decoder parameters
         self.decoder_dim = decoder_dim
         self.decoder_pixel_to_emb = nn.Linear(hrrr_pixel_values_per_patch,self.hrrr_decoder_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, 910, self.hrrr_decoder_dim))
 
         self.enc_to_dec = nn.Linear(self.hrrr_decoder_dim, decoder_dim) if self.hrrr_decoder_dim != decoder_dim else nn.Identity()
         self.enc_to_dec_pos = nn.Linear(self.hrrr_decoder_dim, decoder_dim) if self.hrrr_decoder_dim != decoder_dim else nn.Identity()
@@ -248,6 +262,7 @@ class MAE_decoder(nn.Module):
         batch = tokens.shape[0]
         batch_range = torch.arange(batch, device = device)[:, None]
 
+
         hrrr_patches = img_y
 
         #BEGIN EXP
@@ -263,16 +278,14 @@ class MAE_decoder(nn.Module):
         tokens = tokens[batch_range,encoder_unmasked_indices]
 
         memory =  self.encoder.transformer(tokens)
-        memory =  self.memory_to_dec(memory)
+        memory =  self.hrrr_decoder.enc_to_dec(memory)
+        memory += self.hrrr_decoder.enc_to_dec_pos(self.encoder.positional_ff(self.encoder.pos_embedding.to(device, dtype=memory.dtype)[0,torch.remainder(encoder_unmasked_indices,1056)]))
 
         num_masked = int(local_decoder_masking_ratio*self.hrrr_num_patches)
 
         hrrr_tokens = torch.zeros(batch, self.hrrr_num_patches, self.hrrr_decoder_dim).to(device)
         hrrr_tokens = self.decoder_pixel_to_emb(img_y)
-
-        # JRD Test
-        #print(pix_recon.shape)
-        #print(hrrr_tokens.shape)
+        hrrr_tokens += self.hrrr_decoder.positional_ff(self.hrrr_decoder.pos_embedding[:,:])
 
         # Must have at least one masked patch
         if num_masked == 0:
@@ -286,11 +299,13 @@ class MAE_decoder(nn.Module):
             masked_indices, _ = rand_indices[:,:], None
             masked_patches = hrrr_patches[batch_range,masked_indices]
 
-            hrrr_decoded_tokens = hrrr_tokens
+            hrrr_decoded_tokens = self.hrrr_decoder.transformer(hrrr_tokens, memory)
+            #hrrr_decoded_tokens = self.hrrr_decoder.transformer(hrrr_tokens, torch.zeros_like(memory,device=memory.device)) JRD!
             hrrr_decoded_tokens = self.enc_to_dec(hrrr_decoded_tokens)
 
             mask_tokens = repeat(self.mask_token, 'd -> b n d', b = batch, n = self.hrrr_num_patches)
-            mask_tokens = mask_tokens + self.enc_to_dec_pos(self.pos_embedding[0,masked_indices])
+            mask_tokens = mask_tokens +\
+                    self.enc_to_dec_pos(self.hrrr_decoder.positional_ff(self.hrrr_decoder.pos_embedding)[0,masked_indices])
 
             decoder_tokens = torch.zeros(batch,self.hrrr_num_patches,self.decoder_dim, device=device)
             decoder_tokens[batch_range,masked_indices] = mask_tokens
@@ -300,8 +315,7 @@ class MAE_decoder(nn.Module):
             pred_pixel_values = self.to_pixels(mask_tokens)
 
             #return pred_pixel_values[:,0,...], hrrr_patches, None
-            #return pred_pixel_values, masked_patches, masked_indices
-            return pred_pixel_values, masked_patches, masked_indices, None, None
+            return pred_pixel_values, masked_patches, masked_indices
 
 
         rand_indices = torch.rand(batch, self.hrrr_num_patches, device = device)
@@ -316,20 +330,17 @@ class MAE_decoder(nn.Module):
         masked_patches = hrrr_patches[batch_range, masked_indices]
         # attend with vision transformer
         #hrrr_decoded_tokens = self.hrrr_decoder.transformer(hrrr_tokens, torch.zeros_like(memory,device=memory.device)) # JRD!!!!
-        hrrr_decoded_tokens = hrrr_tokens
+        hrrr_decoded_tokens = self.hrrr_decoder.transformer(hrrr_tokens, memory)
         # project encoder to decoder dimensions, if they are not equal - the paper says you can get away with a smaller dimension for decoder
         hrrr_decoded_tokens = self.enc_to_dec(hrrr_decoded_tokens)
         # reapply decoder position embedding to unmasked tokens
-
         unmasked_decoder_tokens = hrrr_decoded_tokens +\
-            self.enc_to_dec_pos(self.pos_embedding[0,unmasked_indices])
-
-        pix_recon = self.to_pixels(unmasked_decoder_tokens) # JRD
+                self.enc_to_dec_pos(self.hrrr_decoder.positional_ff(self.hrrr_decoder.pos_embedding)[0,unmasked_indices])
 
         # repeat mask tokens for number of masked, and add the positions using the masked indices derived above
         mask_tokens = repeat(self.mask_token, 'd -> b n d', b = batch, n = num_masked)
         mask_tokens = mask_tokens +\
-            self.enc_to_dec_pos(self.pos_embedding[0,masked_indices])
+                self.enc_to_dec_pos(self.hrrr_decoder.positional_ff(self.hrrr_decoder.pos_embedding)[0,masked_indices])
 
         decoder_tokens = torch.zeros(batch, self.hrrr_num_patches, self.decoder_dim, device=device)
         # concat the masked tokens to the decoder tokens and attend with decoder
@@ -341,7 +352,7 @@ class MAE_decoder(nn.Module):
         mask_tokens = decoded_tokens[batch_range, masked_indices]
         pred_pixel_values = self.to_pixels(mask_tokens)
 
-        return pred_pixel_values, masked_patches, masked_indices, pix_recon, img_y[batch_range, unmasked_indices]
+        return pred_pixel_values, masked_patches, masked_indices
 
     def reconstruct(self, img, img_y, two_hours=False, decoder_masking_ratio=1):
 
