@@ -15,22 +15,39 @@ LISA is a deep learning framework for statistical downscaling of near-surface wi
 
 ```
 lisa/
-├── train_acc.py          # Main training script (MAE pre-training + ViT fine-tuning, multi-GPU via Accelerate)
+├── train_acc.py          # Main Accelerate training script (MAE pre-training + ViT fine-tuning)
+├── train.py              # Additional training entry point
 ├── train_unet.py         # U-Net baseline training script
 ├── models/
 │   ├── models.py         # ERA5 encoder/decoder and upscaler architectures
 │   ├── mae.py            # Masked Autoencoder (MAE) module
 │   ├── vit.py            # Vision Transformer (ViT) backbone
 │   └── unet.py           # U-Net architecture
+├── data/
+│   ├── dataloader_nc.py      # Dataset/dataloader utilities
+│   ├── dataloader_nc_unet.py # U-Net dataloader utilities
+│   └── hrrr_mask_reduced.npy # HRRR mask artifact used by preprocessing/loading
 ├── utils/
 │   ├── arguments.py      # Training, model, and optimizer parameter dataclasses
 │   └── forecast_metrics.py  # Evaluation metrics and visualization utilities
+├── checkpoints/
+│   └── lisa_2hr/         # Checkpoints (managed with Git LFS)
+├── AIES-paper-materials/
+│   ├── plot_comparison.ipynb          # Core comparison figures for manuscript
+│   ├── plot_comparison_corr.ipynb     # Correlation comparison figures
+│   ├── plot_comparison_ts.ipynb       # Time-series comparison figures
+│   ├── plot_era5.ipynb                # ERA5-focused diagnostic plots
+│   ├── plot_attribution_var_humboldt.ipynb # Attribution/variance plots (Humboldt)
+│   ├── plot_attribution_var_morro.ipynb    # Attribution/variance plots (Morro)
+│   └── plot_revision_figures.ipynb    # Revision-specific manuscript figures
 ├── normalize.py          # Input normalization utilities
 ├── normalize_ft.py       # Fine-tuning normalization utilities
 ├── normalize2.py         # Additional normalization utilities
 ├── inference.sh          # SLURM script for inference/validation on NERSC Perlmutter
 ├── launch.sh             # Launch script for local/CPU multi-process runs
 ├── test_run.sh           # Script for test runs
+├── GIT_LFS_GUIDE.md      # Large file / checkpoint workflow and troubleshooting
+├── .gitattributes        # Git LFS tracking rules
 ├── wind.yml              # Conda environment specification
 └── requirements.txt      # Minimal pip dependencies
 ```
@@ -48,6 +65,37 @@ This environment requires a CUDA-capable GPU. The code was developed and tested 
 - Python 3.11
 - PyTorch 2.2.1
 - CUDA 11.8
+
+---
+
+## Large Files and Checkpoints (Git LFS)
+
+This repository uses Git LFS for large checkpoint artifacts under `checkpoints/**`.
+
+Start here for full instructions:
+- [GIT_LFS_GUIDE.md](GIT_LFS_GUIDE.md)
+
+Minimum setup on a new machine:
+
+```bash
+git lfs install
+git lfs pull
+```
+
+Useful checks:
+
+```bash
+git lfs track
+git lfs ls-files
+```
+
+---
+
+## AIES Paper Materials
+
+Publication figure-generation notebooks are located in [AIES-paper-materials/](AIES-paper-materials/).
+
+These notebooks are intended for manuscript analysis and figure production (comparison plots, ERA5 diagnostics, attribution plots, and revision figures).
 
 ---
 
